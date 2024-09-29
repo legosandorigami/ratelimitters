@@ -23,16 +23,25 @@ type RateLimiterBase struct {
 	allowCh  chan requestTokensCh
 	stopFunc context.CancelFunc
 	wg       sync.WaitGroup
+	isClosed bool
+	mu       sync.RWMutex
 }
 
 func (rlb *RateLimiterBase) Allow(tokens int) bool {
 	if tokens <= 0 {
 		return false
 	}
+	isClosed := false
+	rlb.mu.RLock()
+	isClosed = rlb.isClosed
+	rlb.mu.RUnlock()
+	if isClosed {
+		return false
+	}
 
 	reqTokensCh := requestTokensCh{
 		tokens: tokens,
-		resCh:  make(chan bool),
+		resCh:  make(chan bool, 1),
 	}
 
 	rlb.allowCh <- reqTokensCh
@@ -42,6 +51,9 @@ func (rlb *RateLimiterBase) Allow(tokens int) bool {
 func (rlb *RateLimiterBase) Stop() {
 	rlb.stopFunc()
 	rlb.wg.Wait()
+	rlb.mu.Lock()
+	rlb.isClosed = true
+	rlb.mu.Unlock()
 	close(rlb.allowCh)
 }
 
@@ -103,6 +115,7 @@ func (rl *TokenBucket) tokenBucketAlgorithm(ctx context.Context) {
 				resp = false
 			}
 			reqTokensCh.resCh <- resp
+			close(reqTokensCh.resCh)
 		}
 	}
 }
@@ -170,6 +183,7 @@ func (rl *LeakyBucket) leakyBucketAlgorithm(ctx context.Context) {
 				resp = false
 			}
 			reqTokensCh.resCh <- resp
+			close(reqTokensCh.resCh)
 		}
 	}
 }
@@ -220,11 +234,16 @@ func (rl *FixedWindow) fixedWindowAlgorithm(ctx context.Context) {
 			resp := false
 			if timePassed >= rl.windowSize {
 				rl.lastTime = currentTime
-				rl.tokens = rl.capacity
-				resp = true
+				rl.tokens = rl.capacity - reqTokensCh.tokens
+				if rl.tokens < 0 {
+					rl.tokens = rl.capacity
+					resp = false
+				} else {
+					resp = true
+				}
 			} else {
-				if rl.tokens > 0 {
-					rl.tokens -= 1
+				if rl.tokens >= reqTokensCh.tokens {
+					rl.tokens -= reqTokensCh.tokens
 					resp = true
 				} else {
 					resp = false
@@ -232,6 +251,7 @@ func (rl *FixedWindow) fixedWindowAlgorithm(ctx context.Context) {
 			}
 			fmt.Printf("total new tokens: %d ", rl.tokens)
 			reqTokensCh.resCh <- resp
+			close(reqTokensCh.resCh)
 		}
 	}
 }
@@ -274,18 +294,26 @@ func (rl *SlidingWindow) slidingWindowAlgorithm(ctx context.Context) {
 			return
 		case reqTokensCh := <-rl.allowCh:
 			currentTime := time.Now()
-			rl.timeStamps = append(rl.timeStamps, currentTime)
+			// append as many entries as tokens requested
+			for i := 0; i < reqTokensCh.tokens; i++ {
+				rl.timeStamps = append(rl.timeStamps, currentTime)
+			}
 			fmt.Printf("total requests: %d, limit: %d ", reqTokensCh.tokens, rl.limit)
 
-			for len(rl.timeStamps) > 0 && rl.timeStamps[0].Before(currentTime.Add(-rl.windowSize*time.Second)) {
+			for len(rl.timeStamps) > 0 && rl.timeStamps[0].Before(currentTime.Add(-rl.windowSize)) {
 				rl.timeStamps = rl.timeStamps[1:]
 			}
 			fmt.Printf("total requests after sliding: %d ", len(rl.timeStamps))
 			resp := false
-			if len(rl.timeStamps) <= rl.limit {
+			totalTokensInWindow := len(rl.timeStamps)
+			if totalTokensInWindow <= rl.limit {
 				resp = true
+			} else {
+				// roll back the tokens if the request can't be fulfilled
+				rl.timeStamps = rl.timeStamps[:totalTokensInWindow-reqTokensCh.tokens]
 			}
 			reqTokensCh.resCh <- resp
+			close(reqTokensCh.resCh)
 		}
 	}
 }
